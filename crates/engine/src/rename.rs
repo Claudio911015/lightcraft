@@ -301,6 +301,19 @@ fn sidecars(path: &str) -> Vec<(PathBuf, SidecarNaming, bool)> {
     v
 }
 
+/// Whether the sidecar candidate `sc` (from [`sidecars`]) is a file of its own spelling. On a
+/// case-insensitive volume (default APFS, NTFS) `a.XMP` also answers for `a.xmp`; taking that
+/// alias would rename the sidecar to `Trip.XMP` and look past a failure on its real name, so a
+/// spelling that is not in the folder gives way to the other one that is. Folders are only
+/// listed when both spellings answer, so a case-sensitive volume with one sidecar never pays.
+fn sidecar_present(fs: &dyn MoveFs, sc: &Path, upper: bool) -> bool {
+    if !fs.is_file(sc) {
+        return false;
+    }
+    let other = sc.with_extension(if upper { "xmp" } else { "XMP" });
+    !fs.is_file(&other) || fs.spelled(sc) || !fs.spelled(&other)
+}
+
 /// The file-system primitives renaming uses. [`RealFs`] is the disk; tests substitute a model of
 /// a case-insensitive or case-sensitive volume (and inject failures).
 pub(crate) trait MoveFs {
@@ -319,6 +332,16 @@ pub(crate) trait MoveFs {
     /// Another photo file beside the stem-named sidecar `sidecar` that shares its stem (e.g.
     /// `IMG_1.JPG` for `IMG_1.xmp`), which still uses that sidecar.
     fn stem_sibling(&self, sidecar: &Path) -> Option<String>;
+    /// The folder of `p` lists an entry spelled exactly like its file name (on a
+    /// case-insensitive volume `p` can answer under another spelling). When in doubt: `true`.
+    fn spelled(&self, p: &Path) -> bool {
+        let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return true };
+        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        match std::fs::read_dir(dir) {
+            Ok(entries) => entries.flatten().any(|e| e.file_name() == name),
+            Err(_) => true,
+        }
+    }
     /// Content observed in a packet, independent of its pathname or inode. Model volumes
     /// override this; disk implementations stream a bounded buffer without retaining the XML.
     fn packet_version(&self, path: &Path) -> std::io::Result<PacketVersion> {
@@ -701,13 +724,13 @@ pub(crate) fn move_file_with(fs: &dyn MoveFs, from: &str, to: &str) -> std::resu
     }
     let mut packets: Vec<RetainedPacket> = sidecars(from)
         .into_iter()
+        .filter(|(p, _, upper)| sidecar_present(fs, p, *upper))
         .map(|(p, _, _)| p)
-        .filter(|p| fs.is_file(p))
         .map(|path| RetainedPacket { version: fs.packet_version(&path).ok(), path })
         .collect();
     move_one(fs, f, t).map_err(|e| fail(format!("rename {from}: {e}")))?;
     let mut done: Vec<SidecarMove> = Vec::new();
-    let mut remaining = sidecars(from).into_iter().filter(|(sc, _, _)| fs.is_file(sc)).map(|(sc, naming, upper)| {
+    let mut remaining = sidecars(from).into_iter().filter(|(sc, _, upper)| sidecar_present(fs, sc, *upper)).map(|(sc, naming, upper)| {
         let mut dst = crate::sidecar::sidecar_path(to, naming);
         if upper {
             dst = dst.with_extension("XMP");
@@ -1171,7 +1194,14 @@ pub(crate) mod tests {
         }
         fn idx(&self, p: &Path) -> Option<usize> {
             let p = Self::norm(p);
-            self.files.borrow().iter().position(|(f, _)| if self.ci { folded_path(f) == folded_path(&p) } else { *f == p })
+            self.files.borrow().iter().position(|(f, _)| {
+                let f = f.replace('\\', "/");
+                if self.ci { folded_path(&f) == folded_path(&p) } else { f == p }
+            })
+        }
+        /// An injected failure for a source path (spelled with either separator).
+        fn fails(&self, a: &Path) -> bool {
+            self.fail.borrow().iter().any(|f| Self::norm(a).contains(&f.replace('\\', "/")))
         }
         /// The listing: (exact path, contents), sorted.
         pub fn listing(&self) -> Vec<(String, String)> {
@@ -1196,7 +1226,7 @@ pub(crate) mod tests {
             self.idx(a).is_some() && self.idx(a) == self.idx(b)
         }
         fn rename_no_replace(&self, a: &Path, b: &Path) -> std::io::Result<()> {
-            if self.fail.borrow().iter().any(|f| Self::norm(a).contains(f.as_str())) {
+            if self.fails(a) {
                 return Err(std::io::Error::other("injected failure"));
             }
             if self.exists(b) {
@@ -1207,7 +1237,7 @@ pub(crate) mod tests {
             Ok(())
         }
         fn copy_no_replace(&self, a: &Path, b: &Path) -> std::io::Result<()> {
-            if self.fail.borrow().iter().any(|f| Self::norm(a).contains(f.as_str())) {
+            if self.fails(a) {
                 return Err(std::io::Error::other("injected failure"));
             }
             if self.exists(b) {
@@ -1222,6 +1252,10 @@ pub(crate) mod tests {
             let i = self.idx(p).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))?;
             self.files.borrow_mut().remove(i);
             Ok(())
+        }
+        fn spelled(&self, p: &Path) -> bool {
+            let p = Self::norm(p);
+            self.files.borrow().iter().any(|(f, _)| f.replace('\\', "/") == p)
         }
         fn stem_sibling(&self, sidecar: &Path) -> Option<String> {
             let stem = Self::norm(&sidecar.with_extension(""));
@@ -1293,7 +1327,7 @@ pub(crate) mod tests {
                     } else {
                         serde_json::json!({"path": from, "into": root.join("Archive")})
                     };
-                    let to = if command == "folder.rename" { root.join("Holiday") } else { root.join("Archive/Trip") };
+                    let to = if command == "folder.rename" { root.join("Holiday") } else { root.join("Archive").join("Trip") };
                     let before = s.catalog.to_snapshot();
                     let history = (s.undo.len(), s.redo.len());
                     assert!(s.execute(command, &params).is_err());
@@ -1377,6 +1411,32 @@ pub(crate) mod tests {
         move_all(&fs, &moves).unwrap();
         s.catalog.apply(undo.clone()).unwrap();
         assert_eq!(fs.listing(), before);
+    }
+
+    /// On a case-insensitive volume `a.XMP` answers for `a.xmp`: the sidecar keeps the spelling
+    /// it has on disk (not `Trip.XMP`), and an operation on it is one on its real name, so a
+    /// failure there is seen (the Windows CI failures of the partial-move tests).
+    #[test]
+    fn case_insensitive_volumes_keep_the_sidecar_spelling() {
+        for upper in [false, true] {
+            let ext = if upper { "XMP" } else { "xmp" };
+            let fs = FakeFs::new(true, &[("/p/a.jpg", "Photo"), (&format!("/p/a.{ext}"), "Stem"), (&format!("/p/a.jpg.{ext}"), "Full")]);
+            move_file_with(&fs, "/p/a.jpg", "/p/Trip.jpg").unwrap();
+            let mut renamed: Vec<(String, String)> = vec![
+                ("/p/Trip.jpg".into(), "Photo".into()),
+                (format!("/p/Trip.jpg.{ext}"), "Full".into()),
+                (format!("/p/Trip.{ext}"), "Stem".into()),
+            ];
+            renamed.sort();
+            assert_eq!(fs.listing(), renamed);
+            let fs = FakeFs::new(true, &[("/p/a.jpg", "Photo"), (&format!("/p/a.{ext}"), "Stem"), (&format!("/p/a.jpg.{ext}"), "Full")]);
+            *fs.fail.borrow_mut() = vec![format!("/p/a.jpg.{ext}")];
+            assert!(move_file_with(&fs, "/p/a.jpg", "/p/Trip.jpg").is_err(), "the failure on the real name is not bypassed");
+            let mut kept: Vec<(String, String)> =
+                vec![("/p/a.jpg".into(), "Photo".into()), (format!("/p/a.jpg.{ext}"), "Full".into()), (format!("/p/a.{ext}"), "Stem".into())];
+            kept.sort();
+            assert_eq!(fs.listing(), kept);
+        }
     }
 
     /// Issue #95: a case-only rename is a real change on a case-insensitive volume and never
