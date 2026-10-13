@@ -134,20 +134,30 @@ fn dropping_the_lock_frees_the_library_while_another_thread_spawns_processes() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let dir = temp_dir("spawn");
+    // `true` is /bin/true on Linux and macOS but only /usr/bin/true on FreeBSD; /bin/sh with
+    // no input exits at once and is everywhere.
+    let program = ["/usr/bin/true", "/bin/true"].into_iter().find(|p| std::path::Path::new(p).is_file()).unwrap_or("/bin/sh");
     let stop = Arc::new(AtomicBool::new(false));
     let spawner = {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             let mut spawned = 0usize;
+            let mut last_error = None;
             while !stop.load(Ordering::Relaxed) {
-                if let Ok(mut c) =
-                    std::process::Command::new("/bin/true").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()
-                {
-                    let _ = c.wait();
-                    spawned += 1;
+                let child = std::process::Command::new(program)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                match child {
+                    Ok(mut c) => {
+                        let _ = c.wait();
+                        spawned += 1;
+                    }
+                    Err(e) => last_error = Some(e.to_string()),
                 }
             }
-            spawned
+            (spawned, last_error)
         })
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -161,9 +171,9 @@ fn dropping_the_lock_frees_the_library_while_another_thread_spawns_processes() {
         cycles += 1;
     }
     stop.store(true, Ordering::Relaxed);
-    let spawned = spawner.join().unwrap();
+    let (spawned, spawn_error) = spawner.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(spawned > 0, "the spawning thread never got a child off the ground");
+    assert!(spawned > 0, "the spawning thread never got a child of {program} off the ground: {spawn_error:?}");
     assert!(
         refused.is_empty(),
         "{} of {cycles} re-acquires refused while {spawned} children were spawned: {:?}",
