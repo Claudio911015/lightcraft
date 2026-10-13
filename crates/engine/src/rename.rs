@@ -335,12 +335,7 @@ pub(crate) trait MoveFs {
     /// The folder of `p` lists an entry spelled exactly like its file name (on a
     /// case-insensitive volume `p` can answer under another spelling). When in doubt: `true`.
     fn spelled(&self, p: &Path) -> bool {
-        let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return true };
-        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-        match std::fs::read_dir(dir) {
-            Ok(entries) => entries.flatten().any(|e| e.file_name() == name),
-            Err(_) => true,
-        }
+        crate::sidecar::spelled_on_disk(p)
     }
     /// Content observed in a packet, independent of its pathname or inode. Model volumes
     /// override this; disk implementations stream a bounded buffer without retaining the XML.

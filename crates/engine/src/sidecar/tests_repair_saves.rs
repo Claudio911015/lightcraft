@@ -151,7 +151,9 @@ fn autowrite_repairs_partial_rename_before_merging_foreign_xmp_across_library_sw
                     assert_eq!(parsed.title.as_deref(), Some("Final title"));
                     assert!(parsed.keywords.as_ref().unwrap().contains(&"café".to_string()));
                     if upper {
-                        assert!(!preferred.exists(), "merge uses the repaired uppercase packet");
+                        // spelled exactly: on a case-insensitive volume `preferred` answers for the uppercase packet
+                        assert!(!crate::sidecar::spelled_on_disk(&preferred), "merge uses the repaired uppercase packet");
+                        assert!(crate::sidecar::spelled_on_disk(&destination), "and keeps its spelling");
                     }
                     for (step, title) in [("edit.undo", "Fresh title"), ("edit.redo", "Final title")] {
                         s.execute(step, &json!({})).unwrap();

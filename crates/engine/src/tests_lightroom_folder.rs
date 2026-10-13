@@ -155,17 +155,23 @@ fn odd_folders_never_fail_the_check() {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        let bad = root.join(std::ffi::OsStr::from_bytes(b"caf\xe9 Previews.lrdata"));
-        std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(root.join("Cat.lrcat"), b"x").unwrap();
-        assert_eq!(lightroom_catalog_at(&bad), Some(LightroomPlace { catalog: Some(root.join("Cat.lrcat")) }), "non-UTF-8 name");
-        let lr = root.join(std::ffi::OsStr::from_bytes(b"\xff\xfe"));
-        std::fs::create_dir_all(&lr).unwrap();
-        std::fs::write(lr.join(std::ffi::OsStr::from_bytes(b"\xff.lrcat")), b"x").unwrap();
-        std::fs::write(lr.join("b.lrcat"), b"x").unwrap();
-        assert_eq!(lightroom_catalog_at(&lr), Some(LightroomPlace { catalog: Some(lr.join("b.lrcat")) }), "non-UTF-8 entries skipped");
+        let bad = root.join(std::ffi::OsStr::from_bytes(b"caf\xe9 Previews.lrdata"));
+        // APFS (macOS) and other file systems that store only UTF-8 names refuse these
+        // (EILSEQ): there is no such folder to find there
+        if std::fs::create_dir_all(&bad).is_ok() {
+            assert_eq!(lightroom_catalog_at(&bad), Some(LightroomPlace { catalog: Some(root.join("Cat.lrcat")) }), "non-UTF-8 name");
+            let lr = root.join(std::ffi::OsStr::from_bytes(b"\xff\xfe"));
+            std::fs::create_dir_all(&lr).unwrap();
+            std::fs::write(lr.join(std::ffi::OsStr::from_bytes(b"\xff.lrcat")), b"x").unwrap();
+            std::fs::write(lr.join("b.lrcat"), b"x").unwrap();
+            assert_eq!(lightroom_catalog_at(&lr), Some(LightroomPlace { catalog: Some(lr.join("b.lrcat")) }), "non-UTF-8 entries skipped");
+        }
         // a symlink to a catalog folder is one too; a dangling one is not
-        std::os::unix::fs::symlink(&lr, root.join("link")).unwrap();
+        let catalog_folder = root.join("catalog folder");
+        std::fs::create_dir_all(&catalog_folder).unwrap();
+        std::fs::write(catalog_folder.join("b.lrcat"), b"x").unwrap();
+        std::os::unix::fs::symlink(&catalog_folder, root.join("link")).unwrap();
         assert!(lightroom_catalog_at(&root.join("link")).is_some());
         std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling")).unwrap();
         assert_eq!(lightroom_catalog_at(&root.join("dangling")), None);

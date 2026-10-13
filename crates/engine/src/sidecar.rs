@@ -73,7 +73,30 @@ pub fn find_sidecar(original: &str, naming: SidecarNaming) -> Option<PathBuf> {
             let upper = p.with_extension("XMP");
             [p, upper]
         })
-        .find(|p| p.is_file())
+        .find(|p| is_sidecar_file(p))
+}
+
+/// The folder of `p` lists an entry spelled exactly like its file name. When in doubt: `true`.
+pub(crate) fn spelled_on_disk(p: &Path) -> bool {
+    let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return true };
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().any(|e| e.file_name() == name),
+        Err(_) => true,
+    }
+}
+
+/// `p` (a `.xmp` or `.XMP` spelling) is a file under its own spelling. On a case-insensitive
+/// volume (default APFS, NTFS) `a.xmp` also answers for `a.XMP`; writing through that alias
+/// would respell the user's file, so a spelling that isn't in the folder gives way to the other
+/// one that is. The folder is only listed when both spellings answer.
+pub(crate) fn is_sidecar_file(p: &Path) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    let upper = p.extension().is_some_and(|e| e == "XMP");
+    let other = p.with_extension(if upper { "xmp" } else { "XMP" });
+    !other.is_file() || spelled_on_disk(p) || !spelled_on_disk(&other)
 }
 
 /// What a sidecar (or embedded XMP packet) says about a photo. `None` = not stated.
@@ -566,7 +589,7 @@ impl Session {
             .map_err(|e| EngineError::Other(format!("{}: unfinished XMP repair: {e}", preferred.display())))?;
         // Keep an existing packet's spelling/style so foreign properties survive this save and
         // subsequent Undo/Redo writes. Shared stems owned by another photo were excluded above.
-        let path = candidates.into_iter().find(|path| path.is_file()).unwrap_or(preferred);
+        let path = candidates.into_iter().find(|path| is_sidecar_file(path)).unwrap_or(preferred);
         self.validate_sidecar_packets_for_paths(std::slice::from_ref(&path), &crate::rename::RealFs)?;
         let p = self.catalog.photo(id).ok_or(lightcraft_catalog::CatalogError::NoPhoto(id))?;
         let err = |e: std::io::Error| EngineError::Other(format!("{}: {e}", path.display()));
